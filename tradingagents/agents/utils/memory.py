@@ -37,6 +37,7 @@ class TradingMemoryLog:
         """Append pending entry at end of propagate(). No LLM call.
         
         Enforces memory log rotation if max_entries is configured.
+        Dual-writes to SQLite when available.
         """
         if not self._log_path:
             return
@@ -56,6 +57,14 @@ class TradingMemoryLog:
         entry = f"{tag}\n\nDECISION:\n{final_trade_decision}{self._SEPARATOR}"
         with open(self._log_path, "a", encoding="utf-8") as f:
             f.write(entry)
+
+        # Dual-write to SQLite (best-effort, never blocks pipeline)
+        try:
+            from dashboard.db import store_memory_entry, is_db_available
+            if is_db_available():
+                store_memory_entry(ticker, trade_date, rating, final_trade_decision)
+        except Exception:
+            pass
 
     # --- Read path (Phase A) ---
 

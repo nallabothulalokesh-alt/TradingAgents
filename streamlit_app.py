@@ -15,6 +15,7 @@ load_dotenv(ROOT / ".env")
 
 from dashboard.views.single_ticker import render_single_ticker
 from dashboard.views.watchlist import render_watchlist
+from dashboard.views.portfolio import render_portfolio
 from dashboard.views.history import render_history
 from dashboard.views.chat import render_chat
 from dashboard.views.compare import render_compare
@@ -47,7 +48,8 @@ st.markdown("""
 
 _NAV_OPTIONS = [
     "🔍 Single Ticker",
-    "📋 Watchlist",
+    "📊 Multi-Ticker Analysis",
+    "💼 Portfolio",
     "📜 History",
     "⚖️ Compare",
     "💬 Analysis Chat",
@@ -70,8 +72,10 @@ with st.sidebar:
 # ── Route ─────────────────────────────────────────────────────────────────────
 if view == "🔍 Single Ticker":
     render_single_ticker()
-elif view == "📋 Watchlist":
+elif view == "📊 Multi-Ticker Analysis":
     render_watchlist()
+elif view == "💼 Portfolio":
+    render_portfolio()
 elif view == "📜 History":
     render_history()
 elif view == "⚖️ Compare":

@@ -35,6 +35,10 @@ DEFAULT_CONFIG = {
     "max_debate_rounds": 1,
     "max_risk_discuss_rounds": 1,
     "max_recur_limit": 100,
+    # Parallel analyst execution: when True, all selected analysts run
+    # concurrently as isolated subgraphs (40-60% faster). When False,
+    # analysts run sequentially (easier to debug, deterministic log order).
+    "parallel_analysts": True,
     # Data vendor configuration
     # Category-level configuration (default for all tools in category)
     "data_vendors": {

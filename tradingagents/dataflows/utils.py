@@ -33,8 +33,13 @@ def safe_ticker_component(value: str, *, max_len: int = 32) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"ticker must be a non-empty string, got {value!r}")
     
-    # Normalize: strip whitespace, uppercase, remove internal spaces
-    value = value.strip().upper().replace(" ", "")
+    # Reject ANY whitespace in raw input (Bug 11 fix).
+    # Callers that accept user input should .strip() BEFORE calling this.
+    if any(c in value for c in ' \t\n\r'):
+        raise ValueError(f"ticker contains whitespace characters: {value!r}")
+    
+    # Normalize: uppercase
+    value = value.upper()
     
     if len(value) > max_len:
         raise ValueError(f"ticker exceeds {max_len} chars: {value!r}")

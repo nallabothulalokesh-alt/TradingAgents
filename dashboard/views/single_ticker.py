@@ -16,6 +16,7 @@ from __future__ import annotations
 import time
 from datetime import date, datetime, timedelta
 from typing import Dict, Optional
+import html as _html
 
 import streamlit as st
 
@@ -24,7 +25,7 @@ from dashboard.utils import (
     DASHBOARD_CONFIG, RATING_COLORS, RunState,
     validate_ticker, find_cached_run, cached_dates_for_ticker,
     find_recent_run, fast_mode_summary, sanitize_report,
-    check_stale_fundamentals,
+    check_stale_fundamentals, compute_conviction, render_decision_first,
 )
 from dashboard.runner import run_analysis
 
@@ -64,7 +65,6 @@ def _reports_from_cached(data: dict) -> Dict[str, str]:
 def _render_progress(agent_status: Dict[str, str], selected_analysts: list,
                      from_cache: bool = False):
     if from_cache:
-        # All agents done — show a compact "loaded from cache" summary
         st.markdown(
             '<div style="background:#1e3a5f;border:1px solid #3b82f6;border-radius:8px;'
             'padding:10px 16px;color:#93c5fd;font-size:13px">'
@@ -76,11 +76,11 @@ def _render_progress(agent_status: Dict[str, str], selected_analysts: list,
 
     STATUS_ICON  = {
         "pending": "⏳", "running": "🔄", "done": "✅",
-        "error": "❌", "reused": "📦",
+        "error": "❌", "reused": "📦", "failed": "❌",
     }
     STATUS_COLOR = {
         "pending": "#6b7280", "running": "#3b82f6", "done": "#22c55e",
-        "error": "#ef4444",   "reused": "#7c3aed",
+        "error": "#ef4444",   "reused": "#7c3aed", "failed": "#ef4444",
     }
 
     visible_analyst_agents = [ANALYST_TO_AGENT[a] for a in selected_analysts if a in ANALYST_TO_AGENT]
@@ -90,6 +90,41 @@ def _render_progress(agent_status: Dict[str, str], selected_analysts: list,
         teams_to_show["Analyst Team"] = visible_analyst_agents
     teams_to_show.update(fixed_teams)
 
+    # Timeline stepper — horizontal pipeline phases
+    phase_names = list(teams_to_show.keys())
+    phase_statuses = []
+    for team, agents in teams_to_show.items():
+        statuses = [agent_status.get(a, "pending") for a in agents]
+        if all(s in ("done", "reused") for s in statuses):
+            phase_statuses.append("done")
+        elif any(s == "running" for s in statuses):
+            phase_statuses.append("running")
+        elif any(s in ("error", "failed") for s in statuses):
+            phase_statuses.append("error")
+        else:
+            phase_statuses.append("pending")
+
+    # Render horizontal stepper
+    step_html = '<div style="display:flex;align-items:center;gap:4px;margin-bottom:12px;flex-wrap:wrap">'
+    for i, (name, status) in enumerate(zip(phase_names, phase_statuses)):
+        color = STATUS_COLOR.get(status, "#6b7280")
+        icon = STATUS_ICON.get(status, "⏳")
+        bg = f"{color}22"
+        border = color
+        step_html += (
+            f'<div style="background:{bg};border:1px solid {border};border-radius:8px;'
+            f'padding:6px 12px;text-align:center;min-width:100px">'
+            f'<div style="font-size:16px">{icon}</div>'
+            f'<div style="font-size:11px;color:{color};font-weight:600">{name}</div>'
+            f'</div>'
+        )
+        if i < len(phase_names) - 1:
+            arrow_color = "#22c55e" if phase_statuses[i] == "done" else "#334155"
+            step_html += f'<div style="color:{arrow_color};font-size:18px">→</div>'
+    step_html += '</div>'
+    st.markdown(step_html, unsafe_allow_html=True)
+
+    # Detailed agent list below stepper
     cols = st.columns(len(teams_to_show))
     for col, (team, agents) in zip(cols, teams_to_show.items()):
         with col:
@@ -220,34 +255,6 @@ def _render_price_chart(ticker: str, analysis_date: str):
     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
 
-# ── Conviction helper ─────────────────────────────────────────────────────────
-
-def _conviction(reports: Dict[str, str]) -> tuple[str, str]:
-    """Derive a conviction level from the debate and report content.
-
-    Logic:
-    - Count how many analyst reports are present (more = more evidence = higher conviction)
-    - Check if the investment_plan and final_trade_decision agree on direction
-    - Return (label, hex_color)
-    """
-    analyst_count = sum(
-        1 for k in ["market_report", "news_report", "fundamentals_report", "sentiment_report"]
-        if reports.get(k)
-    )
-    has_plan     = bool(reports.get("investment_plan"))
-    has_trader   = bool(reports.get("trader_investment_plan"))
-    has_decision = bool(reports.get("final_trade_decision"))
-
-    score = analyst_count + (1 if has_plan else 0) + (1 if has_trader else 0) + (1 if has_decision else 0)
-
-    if score >= 6:
-        return "High", "#22c55e"
-    elif score >= 4:
-        return "Medium", "#f59e0b"
-    else:
-        return "Low", "#ef4444"
-
-
 # ── Report renderer ───────────────────────────────────────────────────────────
 
 _SECTION_LABELS = {
@@ -281,11 +288,11 @@ def _render_reports(reports: Dict[str, str]):
         th_match = _re.search(r'\*\*Time Horizon\*\*[:\s]+([^\n]+)', text)
         es_match = _re.search(r'\*\*Executive Summary\*\*[:\s]+([^\n]+)', text)
         if pt_match:
-            price_target = pt_match.group(1).strip()
+            price_target = _html.escape(pt_match.group(1).strip())
         if th_match:
-            time_horizon = th_match.group(1).strip()
+            time_horizon = _html.escape(th_match.group(1).strip())
         if es_match:
-            exec_summary = es_match.group(1).strip()
+            exec_summary = _html.escape(es_match.group(1).strip())
 
         # Decision banner
         st.markdown(
@@ -297,7 +304,7 @@ def _render_reports(reports: Dict[str, str]):
         )
 
         # Key metrics row — price target, time horizon, conviction, exec summary
-        conviction_label, conviction_color = _conviction(reports)
+        conviction_label, conviction_color = compute_conviction(reports)
         metric_items = []
         if price_target:
             metric_items.append(("🎯 Price Target", price_target))
@@ -409,19 +416,49 @@ def render_single_ticker():
                 st.caption(f"📦 Cached: {', '.join(cached[:5])}"
                            + (" …" if len(cached) > 5 else ""))
 
-        val_result = st.session_state.get(_VALIDATE_MSG)
-        if val_result:
-            ok, msg = val_result
-            if ok:
-                st.success(msg, icon="✅")
-            else:
-                st.error(msg)
+        # Inline ticker validation with debounce (600ms between validations)
+        if ticker_input and not snap["running"]:
+            _last_val_ticker = st.session_state.get("_st_last_val_ticker", "")
+            _last_val_time = st.session_state.get("_st_last_val_time", 0)
+            _last_val_result = st.session_state.get("_st_last_val_result")
+
+            if ticker_input != _last_val_ticker and (time.time() - _last_val_time) >= 0.6:
+                ok, msg = validate_ticker(ticker_input)
+                st.session_state["_st_last_val_ticker"] = ticker_input
+                st.session_state["_st_last_val_time"] = time.time()
+                st.session_state["_st_last_val_result"] = (ok, msg)
+                _last_val_result = (ok, msg)
+
+            if _last_val_result:
+                ok, msg = _last_val_result
+                if ok:
+                    st.success(msg, icon="✅")
+                else:
+                    st.error(msg)
+        else:
+            # Show manual validation result (from Run button click)
+            val_result = st.session_state.get(_VALIDATE_MSG)
+            if val_result:
+                ok, msg = val_result
+                if ok:
+                    st.success(msg, icon="✅")
+                else:
+                    st.error(msg)
 
         st.divider()
 
+        # Consume date prefill from "Run Again" (one-shot)
+        _prefill_date = st.session_state.pop("st_prefill_date", None)
+        _default_date = date.today()
+        if _prefill_date:
+            try:
+                _default_date = datetime.strptime(_prefill_date, "%Y-%m-%d").date()
+            except ValueError:
+                pass
+
         trade_date = st.date_input(
             "Analysis Date",
-            value=date.today(),
+            value=_default_date,
             max_value=date.today(),
             disabled=snap["running"],
         ).strftime("%Y-%m-%d")
@@ -571,9 +608,14 @@ def render_single_ticker():
                     st.rerun()
 
         else:
+            # Global run guard — prevent concurrent runs across views
+            _global_busy = st.session_state.get("_global_run_active", False)
+            if _global_busy:
+                st.warning("Another analysis is running. Wait for it to complete or cancel it.")
+
             # Normal Run / Load from Cache button
             if st.button("🚀 Run Analysis", use_container_width=True, type="primary",
-                         disabled=not selected_analysts):
+                         disabled=not selected_analysts or _global_busy):
                 # Step 1: validate ticker
                 with st.spinner(f"Validating {ticker_input}…"):
                     ok, msg = validate_ticker(ticker_input)
@@ -637,8 +679,9 @@ def render_single_ticker():
         **Pipeline:**  
         Analysts → Bull/Bear Debate → Research Manager → Trader → Risk Team → Portfolio Manager
         """)
-        if val_result and not val_result[0]:
-            st.error(val_result[1])
+        _val = st.session_state.get(_VALIDATE_MSG)
+        if _val and not _val[0]:
+            st.error(_val[1])
         return
 
     # ── Determine what to display ─────────────────────────────────────────────
@@ -704,13 +747,18 @@ def render_single_ticker():
 
     # ── Progress / cache badge ────────────────────────────────────────────────
     if not from_cache:
+        done_count   = sum(1 for v in display_agents.values() if v in ("done", "reused"))
+        total_count  = len(display_agents) or 1
+        reused_count = sum(1 for v in display_agents.values() if v == "reused")
+        report_count = len(display_reports)
+
+        # Overall progress bar
+        pct = done_count / total_count
+        st.progress(pct, text=f"Pipeline: {done_count}/{total_count} agents complete")
+
         st.markdown("#### Agent Pipeline Progress")
         _render_progress(display_agents, selected_analysts, from_cache=False)
 
-        done_count   = sum(1 for v in display_agents.values() if v in ("done", "reused"))
-        total_count  = len(display_agents)
-        reused_count = sum(1 for v in display_agents.values() if v == "reused")
-        report_count = len(display_reports)
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Agents Completed", f"{done_count} / {total_count}")
         m2.metric("Reused (Fast Mode)", reused_count if reused_count else "—")
@@ -726,9 +774,17 @@ def render_single_ticker():
     st.divider()
 
     # ── Reports + log ─────────────────────────────────────────────────────────
-    if from_cache or not snap["running"]:
-        # Full width for completed / cached results
-        _render_reports(display_reports)
+    if from_cache or (not snap["running"] and snap["done"]):
+        # Full width decision-first layout for completed / cached results
+        if cached_data:
+            render_decision_first(cached_data)
+        elif snap.get("final_state"):
+            render_decision_first(snap["final_state"])
+        else:
+            _render_reports(display_reports)
+    elif not snap["running"] and not snap["done"]:
+        # Idle state — no reports yet
+        pass
     else:
         # Side-by-side with live log while running
         rep_col, log_col = st.columns([3, 1])
@@ -747,6 +803,13 @@ def render_single_ticker():
             )
 
     # ── Auto-rerun while running ──────────────────────────────────────────────
+    # ── Auto-rerun while running (Bug 17 fix) ───────────────────────────────
     if snap["running"]:
-        time.sleep(2)
-        st.rerun()
+        try:
+            from streamlit_autorefresh import st_autorefresh
+            st_autorefresh(interval=2000, key="st_autorefresh")
+        except ImportError:
+            # Fallback: blocking sleep — upgrade Streamlit to 1.33+ or install
+            # streamlit-autorefresh for non-blocking refresh
+            time.sleep(2)
+            st.rerun()

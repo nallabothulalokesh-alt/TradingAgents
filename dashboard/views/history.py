@@ -9,7 +9,7 @@ import streamlit as st
 
 from dashboard.utils import (
     RATING_COLORS, RATING_ORDER, list_history, load_memory_entries, rating_badge,
-    sanitize_report,
+    sanitize_report, render_decision_first,
 )
 
 
@@ -36,97 +36,6 @@ def _rating_pill(rating: str) -> str:
     )
 
 
-def _render_run_detail(data: Dict[str, Any], record: Dict[str, Any]):
-    """Render the full detail of a saved run, with action shortcuts."""
-    import re as _re
-
-    rating = data.get("_rating", "—")
-    _decision_card(rating, data.get("final_trade_decision", ""))
-
-    # ── Price target / time horizon metrics ───────────────────────────────────
-    text = data.get("final_trade_decision", "")
-    pt_match = _re.search(r'\*\*Price Target\*\*[:\s]+([^\n]+)', text)
-    th_match = _re.search(r'\*\*Time Horizon\*\*[:\s]+([^\n]+)', text)
-    if pt_match or th_match:
-        mc = st.columns(2)
-        if pt_match:
-            mc[0].metric("🎯 Price Target", pt_match.group(1).strip())
-        if th_match:
-            mc[1].metric("⏳ Time Horizon", th_match.group(1).strip())
-
-    # ── Shortcut buttons ──────────────────────────────────────────────────────
-    b1, b2, _ = st.columns([1, 1, 3])
-    if b1.button("💬 Open in Chat", key=f"open_chat_{record['ticker']}_{record['date']}",
-                 use_container_width=True):
-        st.session_state["chat_analysis_key"]   = None
-        st.session_state["chat_prefill_ticker"] = record["ticker"]
-        st.session_state["chat_prefill_date"]   = record["date"]
-        st.session_state["_nav_target"] = "💬 Analysis Chat"
-        st.rerun()
-
-    if b2.button("🔄 Run Again", key=f"run_again_{record['ticker']}_{record['date']}",
-                 use_container_width=True):
-        st.session_state["st_ticker_validated"] = record["ticker"]
-        st.session_state["_nav_target"] = "🔍 Single Ticker"
-        st.rerun()
-
-    st.divider()
-
-    # Analyst reports
-    analyst_sections = [
-        ("📊 Market Analysis",    data.get("market_report")),
-        ("📰 News Analysis",      data.get("news_report")),
-        ("🏦 Fundamentals",       data.get("fundamentals_report")),
-        ("💬 Social Sentiment",   data.get("sentiment_report")),
-    ]
-    available_analysts = [(l, c) for l, c in analyst_sections if c]
-    if available_analysts:
-        st.markdown("##### Analyst Reports")
-        tabs = st.tabs([l for l, _ in available_analysts])
-        for tab, (_, content) in zip(tabs, available_analysts):
-            with tab:
-                st.markdown(sanitize_report(content))
-
-    # Research debate
-    debate = data.get("investment_debate_state", {})
-    if debate:
-        with st.expander("🧠 Research Debate", expanded=False):
-            d1, d2 = st.columns(2)
-            with d1:
-                st.markdown("**Bull Researcher**")
-                st.markdown(sanitize_report(debate.get("bull_history") or "*No history*"))
-            with d2:
-                st.markdown("**Bear Researcher**")
-                st.markdown(sanitize_report(debate.get("bear_history") or "*No history*"))
-            if debate.get("judge_decision"):
-                st.markdown("**Research Manager Decision**")
-                st.markdown(sanitize_report(debate["judge_decision"]))
-
-    # Trader plan
-    if data.get("trader_investment_plan"):
-        with st.expander("💼 Trader Plan", expanded=False):
-            st.markdown(sanitize_report(data["trader_investment_plan"]))
-
-    # Risk debate
-    risk = data.get("risk_debate_state", {})
-    if risk:
-        with st.expander("⚖️ Risk Management Debate", expanded=False):
-            r1, r2, r3 = st.columns(3)
-            with r1:
-                st.markdown("**Aggressive**")
-                st.markdown(sanitize_report(risk.get("aggressive_history") or "*No history*"))
-            with r2:
-                st.markdown("**Conservative**")
-                st.markdown(sanitize_report(risk.get("conservative_history") or "*No history*"))
-            with r3:
-                st.markdown("**Neutral**")
-                st.markdown(sanitize_report(risk.get("neutral_history") or "*No history*"))
-
-    # Final decision
-    if data.get("final_trade_decision"):
-        with st.expander("🎯 Final Portfolio Manager Decision", expanded=True):
-            st.markdown(sanitize_report(data["final_trade_decision"]))
-
 
 # ── Main view ─────────────────────────────────────────────────────────────────
 
@@ -147,21 +56,54 @@ def render_history():
             )
         else:
             # ── Filters ───────────────────────────────────────────────────────
-            f1, f2, f3 = st.columns([2, 2, 2])
+            f1, f2, f3, f4 = st.columns([2, 2, 2, 2])
             with f1:
-                all_tickers = sorted({r["ticker"] for r in records})
-                ticker_filter = st.multiselect("Filter by Ticker", all_tickers)
+                ticker_search = st.text_input("🔍 Search ticker", key="hist_search",
+                                             placeholder="e.g. NVDA")
             with f2:
                 rating_filter = st.multiselect("Filter by Rating", RATING_ORDER)
             with f3:
-                sort_by = st.selectbox("Sort by", ["Date (newest)", "Date (oldest)", "Ticker", "Rating"])
+                from datetime import datetime as _dt, timedelta as _td
+                date_from = st.date_input("From date",
+                                         value=_dt.today().date() - _td(days=90),
+                                         key="hist_date_from")
+            with f4:
+                date_to = st.date_input("To date",
+                                       value=_dt.today().date(),
+                                       key="hist_date_to")
+
+            # Return filter (only when SQLite has memory data)
+            from dashboard.db import is_db_available, load_memory_entries_db
+            show_return_filter = False
+            if is_db_available():
+                memory_entries = load_memory_entries_db()
+                if any(e.get("raw_return") is not None for e in memory_entries):
+                    show_return_filter = True
+
+            min_return = None
+            if show_return_filter:
+                min_return = st.slider("Min return %", -50, 100, -50, key="hist_return_filter",
+                                      help="Filter by actual return (requires resolved memory entries)")
+
+            sort_by = st.selectbox("Sort by", ["Date (newest)", "Date (oldest)", "Ticker", "Rating"])
 
             # Apply filters
             filtered = records
-            if ticker_filter:
-                filtered = [r for r in filtered if r["ticker"] in ticker_filter]
+            if ticker_search:
+                filtered = [r for r in filtered if ticker_search.upper() in r["ticker"].upper()]
             if rating_filter:
                 filtered = [r for r in filtered if r["rating"] in rating_filter]
+            if date_from:
+                filtered = [r for r in filtered if r["date"] >= date_from.strftime("%Y-%m-%d")]
+            if date_to:
+                filtered = [r for r in filtered if r["date"] <= date_to.strftime("%Y-%m-%d")]
+
+            # Return filter — join with memory entries
+            if min_return is not None and min_return > -50 and show_return_filter:
+                memory_map = {(e["ticker"], e["trade_date"]): e.get("raw_return")
+                             for e in memory_entries if e.get("raw_return") is not None}
+                filtered = [r for r in filtered
+                           if memory_map.get((r["ticker"], r["date"]), -999) >= min_return / 100]
 
             # Sort
             if sort_by == "Date (newest)":
@@ -213,9 +155,24 @@ def render_history():
                 color  = RATING_COLORS.get(r["rating"], "#6b7280")
                 label  = f"**{r['ticker']}** — {r['date']} — {r['rating']}"
                 with st.expander(label, expanded=False):
-                    detail = dict(r["data"])
-                    detail["_rating"] = r["rating"]
-                    _render_run_detail(detail, r)
+                    # Action buttons
+                    b1, b2, _ = st.columns([1, 1, 3])
+                    if b1.button("💬 Open in Chat", key=f"open_chat_{r['ticker']}_{r['date']}",
+                                 use_container_width=True):
+                        st.session_state["chat_analysis_key"]   = None
+                        st.session_state["chat_prefill_ticker"] = r["ticker"]
+                        st.session_state["chat_prefill_date"]   = r["date"]
+                        st.session_state["_nav_target"] = "💬 Analysis Chat"
+                        st.rerun()
+                    if b2.button("🔄 Run Again", key=f"run_again_{r['ticker']}_{r['date']}",
+                                 use_container_width=True):
+                        st.session_state["st_ticker_validated"] = r["ticker"]
+                        st.session_state["st_prefill_date"] = r["date"]
+                        st.session_state["_nav_target"] = "🔍 Single Ticker"
+                        st.rerun()
+                    st.divider()
+                    # Decision-first layout
+                    render_decision_first(r["data"])
 
     # ── Memory & Reflections tab ──────────────────────────────────────────────
     with tab_memory:

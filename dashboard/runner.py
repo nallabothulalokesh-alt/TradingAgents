@@ -169,11 +169,13 @@ def _update_from_state(state: dict, run_state: RunState, prev: dict):
     # First analyst running signal
     snap = run_state.snapshot()
     if all(s == "pending" for s in snap["agent_status"].values()) and state.get("messages"):
-        for agent in snap["agent_status"]:
-            if "Analyst" in agent:
+        # In parallel mode, all analysts start simultaneously
+        analyst_agents = [a for a in snap["agent_status"] if "Analyst" in a and a not in (
+            "Aggressive Analyst", "Conservative Analyst", "Neutral Analyst")]
+        for agent in analyst_agents:
+            if snap["agent_status"].get(agent) == "pending":
                 run_state.set_agent(agent, "running")
                 run_state.append_log(f"▶ {agent} started")
-                break
 
 
 # ── Fast Mode: build reduced graph ────────────────────────────────────────────
@@ -191,11 +193,7 @@ def _build_fast_graph(graph_obj: TradingAgentsGraph,
       - Risk Team (Aggressive / Conservative / Neutral)
       - Portfolio Manager
 
-    Fundamentals Analyst, Bull/Bear Researchers, and Research Manager are
-    skipped — their outputs are injected directly into the initial state.
-
-    This function builds the graph MANUALLY (not via GraphSetup.setup_graph)
-    because setup_graph always includes the research debate nodes.
+    Supports parallel mode (subgraphs) and sequential mode based on config.
     """
     from langgraph.graph import END, START, StateGraph
     from tradingagents.agents import (
@@ -204,11 +202,14 @@ def _build_fast_graph(graph_obj: TradingAgentsGraph,
         create_neutral_debator, create_portfolio_manager, create_msg_delete,
         AgentState,
     )
+    from tradingagents.graph.setup import _build_analyst_subgraph, _make_analyst_wrapper
 
     # Only keep time-sensitive analysts
     fast_analysts = [a for a in selected_analysts if a in _FAST_MODE_FRESH_ANALYSTS]
     if not fast_analysts:
         fast_analysts = ["market", "news"]
+
+    parallel = graph_obj.config.get("parallel_analysts", True)
 
     # Create analyst nodes
     analyst_creators = {
@@ -217,46 +218,71 @@ def _build_fast_graph(graph_obj: TradingAgentsGraph,
         "social": create_social_media_analyst,
     }
 
+    report_fields = {
+        "market": "market_report",
+        "news": "news_report",
+        "social": "sentiment_report",
+    }
+
     workflow = StateGraph(AgentState)
 
-    # Add analyst nodes
-    for analyst_type in fast_analysts:
-        creator = analyst_creators[analyst_type]
-        workflow.add_node(f"{analyst_type.capitalize()} Analyst", creator(graph_obj.quick_thinking_llm))
-        workflow.add_node(f"Msg Clear {analyst_type.capitalize()}", create_msg_delete())
-        workflow.add_node(f"tools_{analyst_type}", graph_obj.tool_nodes[analyst_type])
+    if parallel and len(fast_analysts) > 1:
+        # Parallel mode: subgraphs per analyst → barrier → Trader
+        for analyst_type in fast_analysts:
+            creator = analyst_creators[analyst_type]
+            analyst_node = creator(graph_obj.quick_thinking_llm)
+            tool_node = graph_obj.tool_nodes[analyst_type]
+            conditional_fn = getattr(graph_obj.conditional_logic, f"should_continue_{analyst_type}")
+            report_field = report_fields[analyst_type]
 
-    # Add Trader, Risk Team, Portfolio Manager
-    workflow.add_node("Trader", create_trader(graph_obj.quick_thinking_llm))
+            subgraph = _build_analyst_subgraph(analyst_type, analyst_node, tool_node, conditional_fn)
+            wrapper = _make_analyst_wrapper(subgraph, report_field, analyst_type)
+            workflow.add_node(f"{analyst_type.capitalize()} Analyst", wrapper)
+
+        workflow.add_node("Analyst Barrier", lambda state: state)
+
+        for analyst_type in fast_analysts:
+            workflow.add_edge(START, f"{analyst_type.capitalize()} Analyst")
+            workflow.add_edge(f"{analyst_type.capitalize()} Analyst", "Analyst Barrier")
+
+        # Barrier → Trader (skip research team)
+        workflow.add_node("Trader", create_trader(graph_obj.quick_thinking_llm))
+        workflow.add_edge("Analyst Barrier", "Trader")
+    else:
+        # Sequential mode: chain analysts → Trader
+        for analyst_type in fast_analysts:
+            creator = analyst_creators[analyst_type]
+            workflow.add_node(f"{analyst_type.capitalize()} Analyst", creator(graph_obj.quick_thinking_llm))
+            workflow.add_node(f"Msg Clear {analyst_type.capitalize()}", create_msg_delete())
+            workflow.add_node(f"tools_{analyst_type}", graph_obj.tool_nodes[analyst_type])
+
+        workflow.add_edge(START, f"{fast_analysts[0].capitalize()} Analyst")
+
+        for i, analyst_type in enumerate(fast_analysts):
+            current_analyst = f"{analyst_type.capitalize()} Analyst"
+            current_tools = f"tools_{analyst_type}"
+            current_clear = f"Msg Clear {analyst_type.capitalize()}"
+
+            workflow.add_conditional_edges(
+                current_analyst,
+                getattr(graph_obj.conditional_logic, f"should_continue_{analyst_type}"),
+                [current_tools, current_clear],
+            )
+            workflow.add_edge(current_tools, current_analyst)
+
+            if i < len(fast_analysts) - 1:
+                next_analyst = f"{fast_analysts[i + 1].capitalize()} Analyst"
+                workflow.add_edge(current_clear, next_analyst)
+            else:
+                workflow.add_node("Trader", create_trader(graph_obj.quick_thinking_llm))
+                workflow.add_edge(current_clear, "Trader")
+
+    # Trader → Risk Team → Portfolio Manager (same for both modes)
     workflow.add_node("Aggressive Analyst", create_aggressive_debator(graph_obj.quick_thinking_llm))
     workflow.add_node("Conservative Analyst", create_conservative_debator(graph_obj.quick_thinking_llm))
     workflow.add_node("Neutral Analyst", create_neutral_debator(graph_obj.quick_thinking_llm))
     workflow.add_node("Portfolio Manager", create_portfolio_manager(graph_obj.deep_thinking_llm))
 
-    # Wire analysts in sequence: START → first analyst
-    workflow.add_edge(START, f"{fast_analysts[0].capitalize()} Analyst")
-
-    for i, analyst_type in enumerate(fast_analysts):
-        current_analyst = f"{analyst_type.capitalize()} Analyst"
-        current_tools = f"tools_{analyst_type}"
-        current_clear = f"Msg Clear {analyst_type.capitalize()}"
-
-        # Analyst → tools (if tool_calls) or → Msg Clear
-        workflow.add_conditional_edges(
-            current_analyst,
-            getattr(graph_obj.conditional_logic, f"should_continue_{analyst_type}"),
-            [current_tools, current_clear],
-        )
-        workflow.add_edge(current_tools, current_analyst)
-
-        # Last analyst's Msg Clear → Trader (skip research team entirely)
-        if i < len(fast_analysts) - 1:
-            next_analyst = f"{fast_analysts[i + 1].capitalize()} Analyst"
-            workflow.add_edge(current_clear, next_analyst)
-        else:
-            workflow.add_edge(current_clear, "Trader")
-
-    # Trader → Risk Team → Portfolio Manager
     workflow.add_edge("Trader", "Aggressive Analyst")
     workflow.add_conditional_edges(
         "Aggressive Analyst",
@@ -317,6 +343,7 @@ def run_analysis(
     selected_analysts: List[str],
     config: Dict[str, Any],
     prior_run: Optional[Dict[str, Any]] = None,   # Fast Mode: prior run data
+    portfolio_context: Optional[str] = None,       # Portfolio context to inject
 ):
     """Launch analysis in a background thread, streaming state into run_state.
 
@@ -335,23 +362,15 @@ def run_analysis(
 
     # Set running=True BEFORE spawning the thread so the very next
     # st.rerun() in the UI sees running=True immediately (no race condition).
-    run_state.running    = True
-    run_state.ticker     = ticker
-    run_state.trade_date = trade_date
-    run_state.agent_status = build_agent_status(
+    run_state.start(ticker, trade_date, build_agent_status(
         selected_analysts, fast_mode=fast_mode, reused_agents=reused_agents
-    )
+    ))
     run_state.append_log(f"Starting {'Fast' if fast_mode else 'Full'} Mode analysis: {ticker} on {trade_date}")
 
     def _worker():
+        # THREAD SAFETY: This runs on a background thread.
+        # Do NOT access st.session_state from here.
         try:
-            run_state.running    = True
-            run_state.ticker     = ticker
-            run_state.trade_date = trade_date
-            run_state.agent_status = build_agent_status(
-                selected_analysts, fast_mode=fast_mode, reused_agents=reused_agents
-            )
-
             mode_label = "Fast Mode" if fast_mode else "Full Mode"
             run_state.append_log(f"Starting {mode_label} analysis: {ticker} on {trade_date}")
 
@@ -389,6 +408,8 @@ def run_analysis(
             else:
                 graph   = graph_obj.graph
                 past_context = graph_obj.memory_log.get_past_context(ticker)
+                if portfolio_context:
+                    past_context = f"{past_context}\n\nPortfolio Context:\n{portfolio_context}" if past_context else f"Portfolio Context:\n{portfolio_context}"
                 init_st = graph_obj.propagator.create_initial_state(
                     ticker, trade_date, past_context=past_context
                 )
@@ -437,6 +458,19 @@ def run_analysis(
 
             # Save to disk and memory log
             graph_obj._log_state(trade_date, final_state)
+
+            # Index into SQLite for fast dashboard queries
+            try:
+                from dashboard.db import index_analysis, is_db_available
+                if is_db_available():
+                    from pathlib import Path as _Path
+                    from tradingagents.dataflows.utils import safe_ticker_component
+                    safe_t = safe_ticker_component(ticker)
+                    log_path = _Path(config.get("results_dir", "")) / safe_t / "TradingAgentsStrategy_logs" / f"full_states_log_{trade_date}.json"
+                    index_analysis(log_path, graph_obj.log_states_dict.get(str(trade_date), final_state))
+            except Exception as e:
+                run_state.append_log(f"⚠️ SQLite indexing skipped: {e}")
+
             graph_obj.memory_log.store_decision(
                 ticker=ticker,
                 trade_date=trade_date,

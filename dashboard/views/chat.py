@@ -129,12 +129,59 @@ def _call_llm(provider: str, model: str,
         return f"❌ LLM error: {exc}"
 
 
+# Model context window limits (tokens)
+_MODEL_CONTEXT_LIMITS = {
+    "gpt-5.4": 128_000, "gpt-5.4-mini": 128_000, "gpt-5.4-turbo": 128_000,
+    "gpt-4o": 128_000, "gpt-4o-mini": 128_000,
+    "deepseek-v4-pro": 64_000, "deepseek-v4-flash": 64_000, "deepseek-chat": 64_000,
+    "claude-4.6-sonnet": 200_000, "claude-4.5-sonnet": 200_000, "claude-4.6-haiku": 200_000,
+    "gemini-3.1-pro": 1_000_000, "gemini-3.1-flash": 1_000_000, "gemini-2.5-pro": 1_000_000,
+    "grok-4-turbo": 128_000, "grok-4": 128_000,
+}
+_DEFAULT_CONTEXT_LIMIT = 8_000
+
+
+def _estimate_tokens(text: str) -> int:
+    return int(len(text.split()) * 1.3)
+
+
+def _trim_messages_to_fit(system_prompt: str, messages: List[Dict[str, str]], model: str):
+    """Trim oldest messages to fit within 80% of model context window.
+
+    Returns (trimmed_messages, was_trimmed).
+    """
+    limit = _MODEL_CONTEXT_LIMITS.get(model, _DEFAULT_CONTEXT_LIMIT)
+    budget = int(limit * 0.8)
+    sys_tokens = _estimate_tokens(system_prompt)
+
+    if sys_tokens >= budget:
+        # System prompt alone exceeds budget — truncate it
+        return messages, True  # caller should warn
+
+    remaining = budget - sys_tokens
+    # Keep messages from newest to oldest until budget exhausted
+    kept = []
+    for m in reversed(messages):
+        msg_tokens = _estimate_tokens(m["content"])
+        if remaining - msg_tokens < 0 and kept:
+            break
+        kept.append(m)
+        remaining -= msg_tokens
+    kept.reverse()
+    return kept, len(kept) < len(messages)
+
+
 def _stream_llm(provider: str, model: str,
                 system_prompt: str,
                 messages: List[Dict[str, str]]):
     """Stream tokens from the LLM. Yields str chunks; yields full reply at end as sentinel."""
     from tradingagents.llm_clients.factory import create_llm_client
     from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+
+    # Context window overflow protection (Bug 9 fix)
+    trimmed_messages, was_trimmed = _trim_messages_to_fit(system_prompt, messages, model)
+    if was_trimmed:
+        yield "ℹ️ *Older messages were trimmed to fit the model's context window.*\n\n"
 
     try:
         client = create_llm_client(provider=provider.lower(), model=model)
@@ -143,7 +190,7 @@ def _stream_llm(provider: str, model: str,
         return
 
     lc_msgs = [SystemMessage(content=system_prompt)]
-    for m in messages:
+    for m in trimmed_messages:
         if m["role"] == "user":
             lc_msgs.append(HumanMessage(content=m["content"]))
         else:
@@ -217,9 +264,190 @@ def _timestamp() -> str:
 def render_chat():
     st.title("💬 Analysis Chat")
     st.caption(
-        "Load any past analysis and chat with the LLM about it. "
-        "Your conversation is **automatically saved** and reloaded next time."
+        "Chat about your analyses. **Single mode**: deep-dive one analysis. "
+        "**Multi mode**: compare and discuss 2-5 analyses together."
     )
+
+    # ── Mode toggle ───────────────────────────────────────────────────────────
+    chat_mode = st.radio("Mode", ["Single", "Multi"], horizontal=True,
+                        key="chat_mode_toggle",
+                        index=1 if st.session_state.get("chat_multi_prefill") else 0)
+
+    if chat_mode == "Multi":
+        _render_multi_chat()
+    else:
+        _render_single_chat()
+
+
+# ── Multi-Mode Chat ───────────────────────────────────────────────────────────
+
+def _build_multi_context(analyses: List[Dict[str, Any]]) -> str:
+    """Build combined system prompt from multiple analyses."""
+    parts = [
+        "# Multi-Analysis Comparison Chat",
+        "",
+        "You are a financial analysis assistant. The user has selected multiple "
+        "analyses and wants to compare, contrast, and discuss them together. "
+        "Reference specific analyses by their ticker and date when answering. "
+        "Do not make up information not present in the reports.",
+        "",
+        "---",
+    ]
+    for i, data in enumerate(analyses, 1):
+        ticker = data.get("company_of_interest", "Unknown")
+        date = data.get("trade_date", "Unknown")
+        parts.append(f"\n## Analysis {i}: {ticker} ({date})")
+        parts.append("")
+        if data.get("final_trade_decision"):
+            parts.append(f"### Final Decision\n{sanitize_report(data['final_trade_decision'])}\n")
+        if data.get("market_report"):
+            parts.append(f"### Market Analysis\n{sanitize_report(data['market_report'])}\n")
+        if data.get("news_report"):
+            parts.append(f"### News\n{sanitize_report(data['news_report'])}\n")
+        if data.get("fundamentals_report"):
+            parts.append(f"### Fundamentals\n{sanitize_report(data['fundamentals_report'])}\n")
+        parts.append("---")
+    return "\n".join(parts)
+
+
+def _render_multi_chat():
+    """Render the multi-analysis chat mode."""
+    records = list_history()
+    if len(records) < 2:
+        st.info("You need at least 2 saved analyses for multi-mode. Run more analyses first.")
+        return
+
+    with st.sidebar:
+        st.markdown("### Select Analyses (2-5)")
+
+        # Build options
+        options_map = {f"{r['ticker']}  ·  {r['date']}  [{r['rating']}]": r for r in records}
+        labels = list(options_map.keys())
+
+        # Handle prefill from Compare view
+        prefill = st.session_state.pop("chat_multi_prefill", None)
+        default_selections = []
+        if prefill:
+            for key in prefill:
+                parts = key.split("|")
+                if len(parts) == 2:
+                    for lbl, r in options_map.items():
+                        if r["ticker"] == parts[0] and r["date"] == parts[1]:
+                            default_selections.append(lbl)
+                            break
+
+        selected_labels = st.multiselect(
+            "Analyses", labels, default=default_selections or None,
+            max_selections=5, key="chat_multi_select",
+        )
+
+        st.divider()
+        st.markdown("### Chat Model")
+        provider = st.selectbox("Provider", list(_PROVIDER_MODELS.keys()),
+                               index=list(_PROVIDER_MODELS.keys()).index(_DEFAULT_PROVIDER),
+                               key="chat_multi_provider")
+        model = st.selectbox("Model", _PROVIDER_MODELS[provider]["models"],
+                            index=_PROVIDER_MODELS[provider]["default"],
+                            key="chat_multi_model")
+
+        st.divider()
+        if st.button("🗑 Clear Chat", use_container_width=True, key="chat_multi_clear"):
+            st.session_state["chat_multi_history"] = []
+            st.rerun()
+
+    # ── Guard: need at least 2 ────────────────────────────────────────────────
+    if len(selected_labels) < 2:
+        st.info("Select at least 2 analyses to start a multi-analysis chat.")
+        # Preserve existing history if user deselects
+        if st.session_state.get("chat_multi_history"):
+            st.caption(f"💬 {len(st.session_state['chat_multi_history'])} messages saved — select 2+ analyses to continue.")
+        return
+
+    # Build context
+    selected_data = [options_map[lbl]["data"] for lbl in selected_labels]
+    context = _build_multi_context(selected_data)
+
+    # Context size warning
+    est_tokens = int(len(context.split()) * 1.3)
+    limit = _MODEL_CONTEXT_LIMITS.get(model, _DEFAULT_CONTEXT_LIMIT)
+    if est_tokens > limit * 0.5:
+        st.warning(f"⚠️ Combined context is large (~{est_tokens:,} tokens). Consider fewer analyses or a larger model.")
+
+    # Show selected analyses summary
+    for lbl in selected_labels:
+        r = options_map[lbl]
+        color = RATING_COLORS.get(r["rating"], "#6b7280")
+        st.markdown(
+            f'<span style="background:{color}22;border:1px solid {color};color:{color};'
+            f'padding:2px 8px;border-radius:6px;font-size:12px;margin-right:4px">'
+            f'{r["ticker"]} {r["rating"]}</span>',
+            unsafe_allow_html=True,
+        )
+
+    st.divider()
+
+    # Load/init history
+    history: List[Dict[str, str]] = st.session_state.get("chat_multi_history", [])
+
+    # Render conversation
+    for msg in history:
+        with st.chat_message(msg["role"], avatar="🧑" if msg["role"] == "user" else "🤖"):
+            st.markdown(msg["content"])
+
+    # Chat input
+    user_input = st.chat_input("Compare these analyses...")
+    if user_input:
+        user_msg = {"role": "user", "content": user_input, "timestamp": _timestamp()}
+        history.append(user_msg)
+        st.session_state["chat_multi_history"] = history
+
+        with st.chat_message("user", avatar="🧑"):
+            st.markdown(user_input)
+
+        with st.chat_message("assistant", avatar="🤖"):
+            placeholder = st.empty()
+            streamed = ""
+            full_reply = ""
+            for chunk in _stream_llm(provider, model, context, history):
+                if isinstance(chunk, tuple) and chunk[0] == "__DONE__":
+                    full_reply = chunk[1]
+                    break
+                streamed += chunk
+                placeholder.markdown(streamed + "▌")
+            final = full_reply or streamed
+            placeholder.markdown(final)
+
+        reply_msg = {"role": "assistant", "content": final, "timestamp": _timestamp()}
+        history.append(reply_msg)
+        st.session_state["chat_multi_history"] = history
+
+        # Persist to SQLite
+        try:
+            from dashboard.db import is_db_available, get_db
+            if is_db_available():
+                conn = get_db()
+                conv_id = st.session_state.get("_chat_multi_conv_id")
+                if not conv_id:
+                    from uuid import uuid4
+                    conv_id = f"multi_{uuid4().hex[:8]}"
+                    st.session_state["_chat_multi_conv_id"] = conv_id
+                for msg in [user_msg, reply_msg]:
+                    for r in selected_data:
+                        conn.execute(
+                            "INSERT INTO chat_messages (conversation_id, analysis_ticker, analysis_date, mode, role, content) VALUES (?,?,?,?,?,?)",
+                            (conv_id, r.get("company_of_interest", ""), r.get("trade_date", ""),
+                             "multi", msg["role"], msg["content"]),
+                        )
+                conn.commit()
+        except Exception:
+            pass
+
+        st.rerun()
+
+
+# ── Single-Mode Chat (original) ──────────────────────────────────────────────
+
+def _render_single_chat():
 
     # ── Sidebar ───────────────────────────────────────────────────────────────
     with st.sidebar:
@@ -240,16 +468,26 @@ def render_chat():
         options_labels = [_label(r) for r in records]
         options_map    = dict(zip(options_labels, records))
 
+        # If navigated here via "Open in Chat", find the matching analysis
+        _prefill_ticker = st.session_state.get("chat_prefill_ticker")
+        _prefill_date = st.session_state.get("chat_prefill_date")
+        _prefill_index = 0  # default to first
+
+        if _prefill_ticker and _prefill_date:
+            _found = next(
+                (i for i, r in enumerate(records)
+                 if r["ticker"] == _prefill_ticker and r["date"] == _prefill_date),
+                None,
+            )
+            if _found is not None:
+                _prefill_index = _found
+            else:
+                st.info(f"Analysis for {_prefill_ticker} on {_prefill_date} not found. It may have been deleted.")
+
         selected_label  = st.selectbox(
             "Choose analysis",
             options_labels,
-            # If navigated here via "Open in Chat", pre-select that analysis
-            index=next(
-                (i for i, r in enumerate(records)
-                 if r["ticker"] == st.session_state.get("chat_prefill_ticker")
-                 and r["date"]   == st.session_state.get("chat_prefill_date")),
-                0,
-            ),
+            index=_prefill_index,
             key="chat_select_analysis",
         )
         # Clear the prefill once consumed

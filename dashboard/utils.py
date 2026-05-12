@@ -128,6 +128,7 @@ DASHBOARD_CONFIG = {
     "quick_think_llm": "deepseek-v4-flash",
     "max_debate_rounds":       1,
     "max_risk_discuss_rounds": 1,
+    "parallel_analysts":       True,
     "data_vendors": {
         "core_stock_apis":      "yfinance",
         "technical_indicators": "yfinance",
@@ -187,12 +188,62 @@ def list_history() -> List[Dict[str, Any]]:
                 })
             except Exception:
                 pass
+
+    # Deduplicate by (ticker, date) — keep newest file by mtime (Bug 6 fix)
+    seen: Dict[tuple, int] = {}
+    for i, r in enumerate(records):
+        key = (r["ticker"].upper(), r["date"])
+        if key in seen:
+            existing_idx = seen[key]
+            existing_mtime = records[existing_idx]["file"].stat().st_mtime
+            current_mtime = r["file"].stat().st_mtime
+            if current_mtime > existing_mtime:
+                seen[key] = i
+        else:
+            seen[key] = i
+    records = [records[i] for i in sorted(seen.values())]
+
     return records
 
 
 def invalidate_history_cache() -> None:
     """Clear the list_history cache so the next render picks up new runs."""
     list_history.clear()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def list_history_summary() -> List[Dict[str, Any]]:
+    """Return lightweight analysis records (no full report text).
+
+    Uses SQLite when available (instant), falls back to filesystem scan.
+    Consumers: History summary table, Portfolio overview, Compare dropdowns.
+    """
+    from dashboard.db import is_db_available, list_analyses
+    if is_db_available():
+        return list_analyses(limit=1000)
+
+    # Filesystem fallback — return lightweight dicts without 'data' key
+    records = []
+    if not RESULTS_DIR.exists():
+        return records
+    for ticker_dir in sorted(RESULTS_DIR.iterdir()):
+        if not ticker_dir.is_dir():
+            continue
+        log_dir = ticker_dir / "TradingAgentsStrategy_logs"
+        if not log_dir.exists():
+            continue
+        for json_file in sorted(log_dir.glob("full_states_log_*.json"), reverse=True):
+            try:
+                data = json.loads(json_file.read_text(encoding="utf-8"))
+                records.append({
+                    "ticker": data.get("company_of_interest", ticker_dir.name),
+                    "trade_date": data.get("trade_date", ""),
+                    "rating": _extract_rating(data.get("final_trade_decision", "")),
+                    "source_file": str(json_file),
+                })
+            except Exception:
+                pass
+    return records
 
 
 def load_run(json_file: Path) -> Dict[str, Any]:
@@ -248,19 +299,39 @@ def save_chat_history(analysis_file: Path, history: List[Dict[str, str]]) -> Non
         pass  # never crash the UI over a save failure
 
 
-def sanitize_report(text: str) -> str:
-    """Remove artefacts that should never appear in a rendered report."""
-    import re as _re
+_HTML_ALLOWLIST_TAGS = frozenset({
+    'b', 'i', 'em', 'strong', 'table', 'tr', 'td', 'th', 'ul', 'ol', 'li',
+    'p', 'br', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote', 'code',
+    'pre', 'span', 'div', 'a', 'hr',
+})
 
+
+def sanitize_report(text: str) -> str:
+    """Remove artefacts that should never appear in a rendered report.
+
+    Uses an allowlist approach: strips all HTML tags EXCEPT those in
+    _HTML_ALLOWLIST_TAGS (keeps their content). Always removes tool_call
+    markup and script tags regardless of allowlist.
+    """
     if not text:
         return text
 
-    cleaned = _re.sub(r'<tool_calls>.*?</tool_calls>', '', text, flags=_re.DOTALL)
-    cleaned = _re.sub(r'<[^>]+>.*?</[^>]+>', '', cleaned, flags=_re.DOTALL)
-    cleaned = _re.sub(r'<tool_calls>.*?</tool_calls>', '', cleaned, flags=_re.DOTALL)
-    cleaned = _re.sub(r'</?(?:antml:)?tool_call[^>]*>', '', cleaned)
-    cleaned = _re.sub(r'</?(?:antml:)?parameter[^>]*>', '', cleaned)
-    cleaned = _re.sub(r'\n{3,}', '\n\n', cleaned).strip()
+    # 1. Remove known dangerous/problematic patterns (content AND tags)
+    cleaned = re.sub(r'<tool_calls>.*?</tool_calls>', '', text, flags=re.DOTALL)
+    cleaned = re.sub(r'<script[^>]*>.*?</script>', '', cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r'</?(?:antml:)?(?:tool_call|parameter)[^>]*>', '', cleaned)
+
+    # 2. Strip non-allowlisted tags (keep content between them)
+    def _strip_non_allowed(match):
+        tag_match = re.match(r'</?(\w+)', match.group(0))
+        if tag_match and tag_match.group(1).lower() in _HTML_ALLOWLIST_TAGS:
+            return match.group(0)
+        return ''
+
+    cleaned = re.sub(r'</?[a-zA-Z][^>]*/?>', _strip_non_allowed, cleaned)
+
+    # 3. Collapse excessive whitespace
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
 
     if not cleaned:
         return (
@@ -269,6 +340,125 @@ def sanitize_report(text: str) -> str:
             "Switch the **Deep thinker** to `deepseek-v4-pro` or `deepseek-chat` and re-run."
         )
     return cleaned
+
+
+# ── Shared conviction helper ──────────────────────────────────────────────────
+
+def compute_conviction(reports: Dict[str, str]) -> tuple:
+    """Compute conviction level from report completeness.
+
+    Returns (label, hex_color). Used by Single Ticker, Compare, History, Portfolio.
+    """
+    fields = ["market_report", "news_report", "fundamentals_report", "sentiment_report",
+              "investment_plan", "trader_investment_plan", "final_trade_decision"]
+    score = sum(1 for f in fields if reports.get(f))
+    if score >= 6:
+        return "High", "#22c55e"
+    elif score >= 4:
+        return "Medium", "#f59e0b"
+    return "Low", "#ef4444"
+
+
+def render_decision_first(data: Dict[str, Any], container=None) -> None:
+    """Render analysis results in decision-first layout.
+
+    Used by Single Ticker (completed), History detail, Compare, Portfolio, Multi-Ticker.
+    Gracefully handles missing fields — skips any section that's empty.
+    """
+    import html as _html
+    _c = container or st
+
+    decision_text = data.get("final_trade_decision", "")
+    if not decision_text and not any(data.get(k) for k in ["market_report", "news_report"]):
+        _c.info("No analysis data available.")
+        return
+
+    # Rating banner
+    rating = _extract_rating(decision_text) if decision_text else ""
+    if rating:
+        color = RATING_COLORS.get(rating, "#6b7280")
+        _c.markdown(
+            f'<div style="background:{color}22;border:2px solid {color};'
+            f'border-radius:12px;padding:18px;margin-bottom:12px">'
+            f'<span style="font-size:22px;font-weight:800;color:{color}">'
+            f'Final Decision: {rating}</span></div>',
+            unsafe_allow_html=True,
+        )
+
+    # Extract key metrics (case-insensitive regex)
+    price_target = time_horizon = exec_summary = None
+    if decision_text:
+        pt_m = re.search(r'(?i)\*\*Price\s+Target\*\*[:\s]*([^\n]+)', decision_text)
+        th_m = re.search(r'(?i)\*\*Time\s+Horizon\*\*[:\s]*([^\n]+)', decision_text)
+        es_m = re.search(r'(?i)\*\*Executive\s+Summary\*\*[:\s]*([^\n]+)', decision_text)
+        if pt_m:
+            price_target = _html.escape(pt_m.group(1).strip())
+        if th_m:
+            time_horizon = _html.escape(th_m.group(1).strip())
+        if es_m:
+            exec_summary = _html.escape(es_m.group(1).strip())
+
+    # Key metrics row
+    reports = {k: data.get(k, "") for k in ["market_report", "news_report", "fundamentals_report",
+              "sentiment_report", "investment_plan", "trader_investment_plan", "final_trade_decision"]}
+    conviction_label, conviction_color = compute_conviction(reports)
+
+    metric_items = []
+    if price_target:
+        metric_items.append(("🎯 Price Target", price_target, None))
+    if time_horizon:
+        metric_items.append(("⏳ Time Horizon", time_horizon, None))
+    metric_items.append(("💡 Conviction", conviction_label, conviction_color))
+
+    if metric_items:
+        cols = _c.columns(len(metric_items))
+        for col, (label, val, mcolor) in zip(cols, metric_items):
+            if mcolor:
+                col.markdown(
+                    f'<div style="background:{mcolor}22;border:1px solid {mcolor};'
+                    f'border-radius:8px;padding:10px 14px;text-align:center">'
+                    f'<div style="font-size:11px;color:#94a3b8;margin-bottom:2px">{label}</div>'
+                    f'<div style="font-size:18px;font-weight:700;color:{mcolor}">{val}</div>'
+                    f'</div>', unsafe_allow_html=True)
+            else:
+                col.metric(label, val)
+
+    # Executive summary
+    if exec_summary:
+        _c.markdown(
+            f'<div style="background:#1e293b;border-radius:8px;padding:10px 14px;'
+            f'font-size:13px;color:#cbd5e1;margin-top:8px">'
+            f'<b>Executive Summary</b><br>{exec_summary}</div>',
+            unsafe_allow_html=True,
+        )
+
+    # Analyst report expanders
+    analyst_sections = [
+        ("📊 Market Analysis", data.get("market_report")),
+        ("📰 News Analysis", data.get("news_report")),
+        ("🏦 Fundamentals", data.get("fundamentals_report")),
+        ("💬 Social Sentiment", data.get("sentiment_report")),
+    ]
+    available = [(lbl, c) for lbl, c in analyst_sections if c]
+    if available:
+        _c.markdown("#### Analyst Reports")
+        for lbl, content in available:
+            with _c.expander(lbl, expanded=False):
+                st.markdown(sanitize_report(content))
+
+    # Pipeline expanders
+    trader_plan = data.get("trader_investment_decision") or data.get("trader_investment_plan")
+    pipeline_sections = [
+        ("🧠 Research Decision", data.get("investment_plan"), False),
+        ("💼 Trader Plan", trader_plan, False),
+        ("🎯 Final Decision", decision_text, True),
+    ]
+    pipeline_available = [(lbl, c, exp) for lbl, c, exp in pipeline_sections if c]
+    if pipeline_available:
+        _c.markdown("#### Decision Pipeline")
+        for lbl, content, expanded in pipeline_available:
+            with _c.expander(lbl, expanded=expanded):
+                st.markdown(sanitize_report(content))
 
 
 def find_cached_run(ticker: str, trade_date: str) -> Optional[Dict[str, Any]]:
@@ -427,6 +617,16 @@ class RunState:
     @property
     def cancelled(self) -> bool:
         return self._cancelled.is_set()
+
+    # ── Atomic initialization (Bug 4 fix) ────────────────────────────────────
+
+    def start(self, ticker: str, trade_date: str, agent_status: Dict[str, str]):
+        """Atomically set all run fields under lock. Call BEFORE spawning thread."""
+        with self._lock:
+            self.running = True
+            self.ticker = ticker
+            self.trade_date = trade_date
+            self.agent_status = agent_status
 
     # ── Setters (called from background thread) ───────────────────────────────
 
