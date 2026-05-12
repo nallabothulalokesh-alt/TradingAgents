@@ -40,6 +40,8 @@ def _fetch_price(ticker: str, analysis_date: str):
             start=start.strftime("%Y-%m-%d"),
             end=(end + timedelta(days=1)).strftime("%Y-%m-%d"),
         )
+        if df.empty:
+            df = yf.Ticker(ticker).history(period="6mo")
         return df if not df.empty else None
     except Exception:
         return None

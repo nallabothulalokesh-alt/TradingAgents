@@ -277,7 +277,7 @@ def _build_fast_graph(graph_obj: TradingAgentsGraph,
                 workflow.add_node("Trader", create_trader(graph_obj.quick_thinking_llm))
                 workflow.add_edge(current_clear, "Trader")
 
-    # Trader → Risk Team → Portfolio Manager (same for both modes)
+    # Trader → Risk Team → Portfolio Manager (sequential — risk analysts share state)
     workflow.add_node("Aggressive Analyst", create_aggressive_debator(graph_obj.quick_thinking_llm))
     workflow.add_node("Conservative Analyst", create_conservative_debator(graph_obj.quick_thinking_llm))
     workflow.add_node("Neutral Analyst", create_neutral_debator(graph_obj.quick_thinking_llm))

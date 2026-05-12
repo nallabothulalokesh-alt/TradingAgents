@@ -18,7 +18,6 @@ from dashboard.views.watchlist import render_watchlist
 from dashboard.views.portfolio import render_portfolio
 from dashboard.views.history import render_history
 from dashboard.views.chat import render_chat
-from dashboard.views.compare import render_compare
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -51,7 +50,6 @@ _NAV_OPTIONS = [
     "📊 Multi-Ticker Analysis",
     "💼 Portfolio",
     "📜 History",
-    "⚖️ Compare",
     "💬 Analysis Chat",
 ]
 
@@ -78,7 +76,5 @@ elif view == "💼 Portfolio":
     render_portfolio()
 elif view == "📜 History":
     render_history()
-elif view == "⚖️ Compare":
-    render_compare()
 elif view == "💬 Analysis Chat":
     render_chat()

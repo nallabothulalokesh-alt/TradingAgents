@@ -156,7 +156,7 @@ def render_history():
                 label  = f"**{r['ticker']}** — {r['date']} — {r['rating']}"
                 with st.expander(label, expanded=False):
                     # Action buttons
-                    b1, b2, _ = st.columns([1, 1, 3])
+                    b1, b2, b3 = st.columns([1, 1, 1])
                     if b1.button("💬 Open in Chat", key=f"open_chat_{r['ticker']}_{r['date']}",
                                  use_container_width=True):
                         st.session_state["chat_analysis_key"]   = None
@@ -170,6 +170,33 @@ def render_history():
                         st.session_state["st_prefill_date"] = r["date"]
                         st.session_state["_nav_target"] = "🔍 Single Ticker"
                         st.rerun()
+                    # Export report as text file
+                    data = r["data"]
+                    report_lines = [
+                        f"TradingAgents Analysis Report",
+                        f"Ticker: {r['ticker']}  |  Date: {r['date']}  |  Rating: {r['rating']}",
+                        "=" * 60, "",
+                    ]
+                    for section, label in [
+                        ("market_report", "MARKET ANALYSIS"),
+                        ("news_report", "NEWS ANALYSIS"),
+                        ("fundamentals_report", "FUNDAMENTALS"),
+                        ("sentiment_report", "SOCIAL SENTIMENT"),
+                        ("investment_plan", "RESEARCH DECISION"),
+                        ("trader_investment_plan", "TRADER PLAN"),
+                        ("final_trade_decision", "FINAL DECISION"),
+                    ]:
+                        content = data.get(section) or data.get("trader_investment_decision", "") if section == "trader_investment_plan" else data.get(section)
+                        if content:
+                            report_lines.extend([f"\n{'─' * 40}", f"## {label}", "─" * 40, content, ""])
+                    b3.download_button(
+                        "📄 Export Report",
+                        data="\n".join(report_lines),
+                        file_name=f"report_{r['ticker']}_{r['date']}.txt",
+                        mime="text/plain",
+                        key=f"export_{r['ticker']}_{r['date']}",
+                        use_container_width=True,
+                    )
                     st.divider()
                     # Decision-first layout
                     render_decision_first(r["data"])

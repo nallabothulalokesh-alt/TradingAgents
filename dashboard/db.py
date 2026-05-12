@@ -81,7 +81,7 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 
 CREATE TABLE IF NOT EXISTS portfolio_positions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ticker TEXT NOT NULL UNIQUE,
+    ticker TEXT NOT NULL,
     shares REAL NOT NULL,
     cost_basis REAL,
     added_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -368,13 +368,13 @@ def load_memory_entries_db(
 # ── Portfolio CRUD ────────────────────────────────────────────────────────────
 
 def add_position(ticker: str, shares: float, cost_basis: float = None) -> bool:
-    """Add or replace a portfolio position."""
+    """Add a new lot/position for a ticker (supports multiple entries per ticker)."""
     try:
         conn = get_db()
         with conn:
             conn.execute(
-                """INSERT OR REPLACE INTO portfolio_positions (ticker, shares, cost_basis, updated_at)
-                   VALUES (?, ?, ?, datetime('now'))""",
+                """INSERT INTO portfolio_positions (ticker, shares, cost_basis)
+                   VALUES (?, ?, ?)""",
                 (ticker.upper(), shares, cost_basis),
             )
         return True
@@ -383,14 +383,14 @@ def add_position(ticker: str, shares: float, cost_basis: float = None) -> bool:
         return False
 
 
-def update_position(ticker: str, shares: float) -> bool:
-    """Update shares for an existing position."""
+def update_position(ticker: str, position_id: int, shares: float, cost_basis: float = None) -> bool:
+    """Update a specific lot by its ID."""
     try:
         conn = get_db()
         with conn:
             conn.execute(
-                "UPDATE portfolio_positions SET shares=?, updated_at=datetime('now') WHERE ticker=?",
-                (shares, ticker.upper()),
+                "UPDATE portfolio_positions SET shares=?, cost_basis=?, updated_at=datetime('now') WHERE id=?",
+                (shares, cost_basis, position_id),
             )
         return True
     except Exception as e:
@@ -398,12 +398,12 @@ def update_position(ticker: str, shares: float) -> bool:
         return False
 
 
-def remove_position(ticker: str) -> bool:
-    """Remove a position from portfolio."""
+def remove_position(position_id: int) -> bool:
+    """Remove a specific lot by its ID."""
     try:
         conn = get_db()
         with conn:
-            conn.execute("DELETE FROM portfolio_positions WHERE ticker=?", (ticker.upper(),))
+            conn.execute("DELETE FROM portfolio_positions WHERE id=?", (position_id,))
         return True
     except Exception as e:
         logger.warning("remove_position failed: %s", e)
@@ -411,11 +411,11 @@ def remove_position(ticker: str) -> bool:
 
 
 def list_positions() -> List[Dict[str, Any]]:
-    """List all portfolio positions with latest analysis info."""
+    """List all portfolio lots with latest analysis info per ticker."""
     try:
         conn = get_db()
         rows = conn.execute("""
-            SELECT p.ticker, p.shares, p.cost_basis, p.added_at, p.updated_at,
+            SELECT p.id, p.ticker, p.shares, p.cost_basis, p.added_at, p.updated_at,
                    a.rating AS last_rating, a.trade_date AS last_analysis_date
             FROM portfolio_positions p
             LEFT JOIN (
@@ -423,7 +423,7 @@ def list_positions() -> List[Dict[str, Any]]:
                        ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY trade_date DESC) as rn
                 FROM analyses
             ) a ON p.ticker = a.ticker AND a.rn = 1
-            ORDER BY p.ticker
+            ORDER BY p.ticker, p.added_at
         """).fetchall()
         return [dict(row) for row in rows]
     except Exception as e:

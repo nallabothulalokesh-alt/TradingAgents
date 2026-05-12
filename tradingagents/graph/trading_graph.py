@@ -240,14 +240,18 @@ class TradingAgentsGraph:
                 )
                 return None, None, None
 
-            end = start + timedelta(days=holding_days + 7)  # buffer for weekends/holidays
+            end = start + timedelta(days=holding_days + 14)  # larger buffer for weekends/holidays
             end_str = end.strftime("%Y-%m-%d")
 
             stock = yf.Ticker(ticker).history(start=trade_date, end=end_str)
             spy = yf.Ticker("SPY").history(start=trade_date, end=end_str)
 
             if len(stock) < 2 or len(spy) < 2:
-                return None, None, None
+                # Fallback: try period-based fetch
+                stock = yf.Ticker(ticker).history(period="1mo")
+                spy = yf.Ticker("SPY").history(period="1mo")
+                if len(stock) < 2 or len(spy) < 2:
+                    return None, None, None
 
             actual_days = min(holding_days, len(stock) - 1, len(spy) - 1)
             raw = float(

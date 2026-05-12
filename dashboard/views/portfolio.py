@@ -10,25 +10,20 @@ Features:
 
 from __future__ import annotations
 
-from datetime import date
 from typing import Any, Dict, List
 
 import streamlit as st
 
 from dashboard.utils import (
-    ALL_ANALYSTS, DASHBOARD_CONFIG, RATING_COLORS,
+    DASHBOARD_CONFIG, RATING_COLORS,
     validate_ticker, render_decision_first, invalidate_history_cache,
 )
 from dashboard.db import (
     is_db_available, add_position, update_position, remove_position, list_positions,
 )
-from dashboard.worker_pool import WorkerPool
 
 
 def _init_portfolio():
-    if "_pf_pool" not in st.session_state:
-        from uuid import uuid4
-        st.session_state["_pf_pool"] = WorkerPool(str(uuid4()), max_concurrency=3)
     if "_pf_results" not in st.session_state:
         st.session_state["_pf_results"] = []
 
@@ -48,15 +43,17 @@ def render_portfolio():
         st.markdown("### Add Position")
         ticker_input = st.text_input("Ticker", placeholder="NVDA", key="pf_ticker").upper().strip()
         shares_input = st.number_input("Shares", min_value=0.01, value=10.0, step=1.0, key="pf_shares")
-        cost_basis_input = st.number_input("Cost basis ($/share, optional)", min_value=0.0, value=0.0, step=1.0, key="pf_cost")
+        cost_basis_input = st.number_input("Buy price ($/share)", min_value=0.01, value=100.0, step=0.01, key="pf_cost",
+                                          help="The price you paid per share")
 
-        # Check if ticker already exists
+        # Check if ticker already exists — show existing lots
         positions = list_positions()
-        existing = next((p for p in positions if p["ticker"] == ticker_input), None)
-        if existing and ticker_input:
-            st.warning(f"⚠️ You currently hold {existing['shares']} shares. Submitting will replace this with {shares_input} shares.")
+        existing_lots = [p for p in positions if p["ticker"] == ticker_input]
+        if existing_lots and ticker_input:
+            total_shares = sum(p["shares"] for p in existing_lots)
+            st.info(f"You already hold {total_shares} shares of {ticker_input} across {len(existing_lots)} lot(s). New entry will be added as a separate lot.")
 
-        if st.button("➕ Add / Update Position", use_container_width=True):
+        if st.button("➕ Add Position", use_container_width=True):
             if not ticker_input:
                 st.error("Enter a ticker symbol")
             else:
@@ -65,35 +62,11 @@ def render_portfolio():
                 if not ok:
                     st.error(msg)
                 else:
-                    cost = cost_basis_input if cost_basis_input > 0 else None
-                    if add_position(ticker_input, shares_input, cost):
-                        st.success(f"{'Updated' if existing else 'Added'} {ticker_input}: {shares_input} shares")
+                    if add_position(ticker_input, shares_input, cost_basis_input):
+                        st.success(f"Added {ticker_input}: {shares_input} shares @ ${cost_basis_input:.2f}")
                         st.rerun()
                     else:
                         st.error("Failed to save position")
-
-        st.divider()
-        st.markdown("### Batch Analysis")
-        pf_analysts = {
-            a: st.checkbox(a.capitalize(), value=(a in ["market", "news", "fundamentals"]),
-                          key=f"pf_analyst_{a}")
-            for a in ALL_ANALYSTS
-        }
-        pf_selected = [a for a, c in pf_analysts.items() if c]
-
-        if st.button("🚀 Analyze All Positions", use_container_width=True, type="primary",
-                    disabled=not positions or st.session_state.get("_global_run_active", False)):
-            st.session_state["_global_run_active"] = True
-            pool = st.session_state["_pf_pool"]
-            trade_date = date.today().strftime("%Y-%m-%d")
-            cfg = {**DASHBOARD_CONFIG}
-            for p in positions:
-                ctx = f"User holds {p['shares']} shares of {p['ticker']}"
-                if p.get("cost_basis"):
-                    ctx += f" at cost basis ${p['cost_basis']:.2f}/share"
-                pool.dispatch(p["ticker"], trade_date, pf_selected, cfg,
-                            portfolio_context=ctx)
-            st.rerun()
 
     # ── Main area ─────────────────────────────────────────────────────────────
     positions = list_positions()
@@ -105,11 +78,13 @@ def render_portfolio():
     # ── Live Overview ─────────────────────────────────────────────────────────
     st.markdown("### Portfolio Overview")
 
-    # Fetch current prices
-    prices = _fetch_prices([p["ticker"] for p in positions])
+    # Fetch current prices (unique tickers only)
+    unique_tickers = list({p["ticker"] for p in positions})
+    prices = _fetch_prices(unique_tickers)
 
-    # Build overview table
+    # Build overview table — show each lot
     total_value = 0
+    total_cost_value = 0
     rows_html = ""
     for p in positions:
         ticker = p["ticker"]
@@ -117,24 +92,29 @@ def render_portfolio():
         cost = p.get("cost_basis")
         price = prices.get(ticker)
         value = price * shares if price else None
+        cost_value = cost * shares if cost else None
         pnl_pct = ((price - cost) / cost * 100) if price and cost else None
 
         if value:
             total_value += value
+        if cost_value:
+            total_cost_value += cost_value
 
         price_str = f"${price:.2f}" if price else "—"
         value_str = f"${value:,.0f}" if value else "—"
+        cost_str = f"${cost:.2f}" if cost else "—"
         pnl_str = f"{pnl_pct:+.1f}%" if pnl_pct is not None else "—"
         pnl_color = "#22c55e" if pnl_pct and pnl_pct >= 0 else "#ef4444" if pnl_pct else "#6b7280"
 
         rating = p.get("last_rating") or "—"
         rating_color = RATING_COLORS.get(rating, "#6b7280")
-        last_date = p.get("last_analysis_date") or "Never"
+        last_date = p.get("last_analysis_date") or "—"
 
         rows_html += (
             f"<tr>"
             f"<td style='padding:6px 12px;font-weight:600'>{ticker}</td>"
             f"<td style='padding:6px 12px'>{shares}</td>"
+            f"<td style='padding:6px 12px'>{cost_str}</td>"
             f"<td style='padding:6px 12px'>{price_str}</td>"
             f"<td style='padding:6px 12px'>{value_str}</td>"
             f"<td style='padding:6px 12px;color:{pnl_color};font-weight:600'>{pnl_str}</td>"
@@ -148,7 +128,8 @@ def render_portfolio():
         <thead><tr style="background:#0f172a;color:#64748b;font-size:12px;text-transform:uppercase">
             <th style="padding:8px 12px;text-align:left">Ticker</th>
             <th style="padding:8px 12px;text-align:left">Shares</th>
-            <th style="padding:8px 12px;text-align:left">Price</th>
+            <th style="padding:8px 12px;text-align:left">Buy Price</th>
+            <th style="padding:8px 12px;text-align:left">Current</th>
             <th style="padding:8px 12px;text-align:left">Value</th>
             <th style="padding:8px 12px;text-align:left">P&L</th>
             <th style="padding:8px 12px;text-align:left">Rating</th>
@@ -158,49 +139,37 @@ def render_portfolio():
     )
 
     if total_value:
-        st.metric("Total Portfolio Value", f"${total_value:,.0f}")
+        mc1, mc2, mc3 = st.columns(3)
+        mc1.metric("Total Value", f"${total_value:,.0f}")
+        if total_cost_value:
+            mc2.metric("Total Cost", f"${total_cost_value:,.0f}")
+            total_pnl = ((total_value - total_cost_value) / total_cost_value) * 100
+            mc3.metric("Total P&L", f"{total_pnl:+.1f}%")
 
     st.divider()
 
-    # ── Batch analysis results ────────────────────────────────────────────────
-    pool = st.session_state["_pf_pool"]
-    new_results = pool.drain_results()
-    if new_results:
-        st.session_state["_pf_results"].extend(new_results)
-
-    pf_results = st.session_state.get("_pf_results", [])
-    if pf_results:
-        st.markdown("### Analysis Results")
-        for r in pf_results:
-            rating = r["decision"] or "—"
-            color = RATING_COLORS.get(rating, "#6b7280")
-            with st.expander(f"**{r['ticker']}** — {rating}"):
-                if r["error"]:
-                    st.error(r["error"])
-                elif r["final_state"]:
-                    render_decision_first(r["final_state"])
-
-    # Check if batch is still running
-    if not pool.is_idle():
-        try:
-            from streamlit_autorefresh import st_autorefresh
-            st_autorefresh(interval=3000, key="pf_autorefresh")
-        except ImportError:
-            import time
-            time.sleep(3)
-            st.rerun()
-    elif st.session_state.get("_global_run_active") and pool.is_idle():
-        st.session_state.pop("_global_run_active", None)
-        invalidate_history_cache()
-
     st.divider()
 
-    # ── Per-position management ───────────────────────────────────────────────
+    # ── Per-position management (edit + remove) ───────────────────────────────
     st.markdown("### Manage Positions")
     for p in positions:
-        with st.expander(f"{p['ticker']} — {p['shares']} shares"):
-            if st.button("🗑 Remove", key=f"pf_remove_{p['ticker']}", use_container_width=True):
-                remove_position(p["ticker"])
+        pid = p["id"]
+        cost_str = f" @ ${p['cost_basis']:.2f}" if p.get("cost_basis") else ""
+        with st.expander(f"{p['ticker']} — {p['shares']} shares{cost_str}"):
+            ec1, ec2 = st.columns(2)
+            new_shares = ec1.number_input("Shares", min_value=0.01, value=float(p["shares"]),
+                                         step=1.0, key=f"pf_edit_shares_{pid}")
+            new_cost = ec2.number_input("Buy price ($/share)", min_value=0.01,
+                                       value=float(p["cost_basis"]) if p.get("cost_basis") else 100.0,
+                                       step=0.01, key=f"pf_edit_cost_{pid}")
+
+            bc1, bc2 = st.columns(2)
+            if bc1.button("💾 Save", key=f"pf_save_{pid}", use_container_width=True):
+                update_position(p["ticker"], pid, new_shares, new_cost)
+                st.success(f"Updated {p['ticker']}: {new_shares} shares @ ${new_cost:.2f}")
+                st.rerun()
+            if bc2.button("🗑 Remove", key=f"pf_remove_{pid}", use_container_width=True):
+                remove_position(pid)
                 st.rerun()
 
 
@@ -208,40 +177,41 @@ def render_portfolio():
 
 @st.cache_data(ttl=60, show_spinner=False)
 def _fetch_prices(tickers: list) -> Dict[str, float]:
-    """Fetch current prices for all tickers. Uses yf.download batch call."""
+    """Fetch current prices for all tickers."""
     if not tickers:
         return {}
+    prices = {}
     try:
         import yfinance as yf
         import pandas as pd
-        df = yf.download(tickers, period="1d", progress=False)
-        prices = {}
-        if df.empty:
-            return prices
-        if len(tickers) == 1:
-            # Single ticker: columns are just ['Open', 'High', 'Low', 'Close', ...]
-            close = df["Close"].iloc[-1] if "Close" in df.columns else None
-            if close and not pd.isna(close):
-                prices[tickers[0]] = float(close)
-        else:
-            # Multi ticker: MultiIndex columns
-            for t in tickers:
-                try:
-                    close = df[("Close", t)].iloc[-1]
+        # Use 5d to handle weekends/holidays where 1d returns empty
+        df = yf.download(tickers, period="5d", progress=False)
+        if not df.empty:
+            if len(tickers) == 1:
+                if "Close" in df.columns and len(df) > 0:
+                    close = df["Close"].iloc[-1]
                     if not pd.isna(close):
-                        prices[t] = float(close)
-                except (KeyError, IndexError):
-                    pass
-        # Fallback for missing tickers
-        for t in tickers:
-            if t not in prices:
-                try:
-                    info = yf.Ticker(t).info
-                    p = info.get("currentPrice") or info.get("regularMarketPrice")
-                    if p:
-                        prices[t] = float(p)
-                except Exception:
-                    pass
-        return prices
+                        prices[tickers[0]] = float(close)
+            else:
+                for t in tickers:
+                    try:
+                        close = df[("Close", t)].iloc[-1]
+                        if not pd.isna(close):
+                            prices[t] = float(close)
+                    except (KeyError, IndexError):
+                        pass
     except Exception:
-        return {}
+        pass
+
+    # Fallback for any tickers still missing — use Ticker.info
+    import yfinance as yf
+    for t in tickers:
+        if t not in prices:
+            try:
+                info = yf.Ticker(t).info
+                p = info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose")
+                if p:
+                    prices[t] = float(p)
+            except Exception:
+                pass
+    return prices

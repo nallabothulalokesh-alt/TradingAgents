@@ -236,6 +236,9 @@ class GraphSetup:
             {"Bull Researcher": "Bull Researcher", "Research Manager": "Research Manager"},
         )
         workflow.add_edge("Research Manager", "Trader")
+
+        # Risk phase — always sequential (risk analysts share risk_debate_state,
+        # parallel execution would cause state corruption)
         workflow.add_edge("Trader", "Aggressive Analyst")
         workflow.add_conditional_edges(
             "Aggressive Analyst",

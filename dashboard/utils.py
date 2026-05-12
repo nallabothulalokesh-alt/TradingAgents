@@ -98,11 +98,14 @@ def validate_ticker(ticker: str) -> tuple[bool, str]:
         import yfinance as yf
         from datetime import date, timedelta
         end   = date.today()
-        start = end - timedelta(days=10)
+        start = end - timedelta(days=14)  # 14 days handles long weekends/holidays
         hist  = yf.Ticker(ticker).history(
             start=start.strftime("%Y-%m-%d"),
             end=end.strftime("%Y-%m-%d"),
         )
+        if hist.empty:
+            # Fallback: try fetching with period parameter (more reliable)
+            hist = yf.Ticker(ticker).history(period="5d")
         if hist.empty:
             return False, (
                 f"'{ticker}' returned no price data. "
